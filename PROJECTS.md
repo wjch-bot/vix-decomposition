@@ -3,17 +3,20 @@
 ## Active Projects
 
 ### VIX Decomposition Research
-- **Goal:** Research CBOE VIX decomposition methodology and create a public reference document
-- **Status:** ✅ Complete
+- **Goal:** Research + reverse-engineer exact formulas for CBOE VIX 6-factor decomposition
+- **Status:** ✅ Phase 1 (methodology) + Phase 2 (implementation) complete
 - **Thread:** Discord #test-run (channel 1486362952331296878)
-- **Output file:** `VIX_DECOMPOSITION.md`
+- **Files:**
+  - `VIX_DECOMPOSITION.md` — full methodology reference (cleaned formulas)
+  - `vix_decomposition.py` — Python reference implementation with validation
 - **Repo:** https://github.com/wjch-bot/vix-decomposition
 - **What was done:**
-  - Fetched and parsed the CBOE VIX Decomposition whitepaper (Aug 2025) from `cdn.cboe.com`
-  - Extracted the 6 decomposition factors: (1) sticky strike expected move, (2) parallel shift, (3) put skew gradient, (4) call skew gradient, (5) downside convexity, (6) upside convexity
-  - Documented the 30-day skew interpolation formula (variance-space weighting of front/back month SPX options)
-  - Included worked examples from the Yen-Carry Unwind scenario
-  - Created GitHub repo `wjch-bot/vix-decomposition` and pushed the .md file
+  - Fetched/parsed CBOE VIX Decomposition whitepaper (Aug 2025) and VIX Methodology PDF
+  - Reverse-engineered exact formulas for all 6 components (Eq 3–9 in doc)
+  - Implemented `decompose_vix_manual()` validated against Yen-Carry Unwind ground truth
+  - F1 = +2.56 pts ✓, F2 = +7.29 pts ✓ (match whitepaper exactly)
+  - Built delta↔moneyness↔strike conversion for skew zone identification
+  - Pushed updated .md + .py to GitHub
 
 ---
 
