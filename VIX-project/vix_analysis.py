@@ -596,18 +596,60 @@ def find_strike_for_delta(target_delta: float, S: float,
 # VIX DECOMPOSITION (all 5 bugs fixed)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_near_term_vol_at_strike(
+    near_df: pd.DataFrame, F: float, T: float, rfr: float,
+    K_target: float, K_atm_near: float
+) -> float:
+    """
+    Get the raw near-term IV at a specific strike from the near-term expiry chain.
+    
+    This is the 'vol_old(S_new)' for F1 per the whitepaper (P13, F1 formula):
+    "vol_old(S_new) = vol of OLD near-term near-ATM option evaluated at NEW near-term near-ATM strike"
+    
+    Uses the OLD near-term near-ATM option type (call if K_target >= K_atm_near, 
+    put if K_target < K_atm_near) at the K_target strike from the raw near-term chain.
+    
+    Parameters
+    ----------
+    near_df     : DataFrame with near-term expiry options (columns: strike, cmid, pmid)
+    F           : forward price for near-term
+    T           : time to expiration in years for near-term
+    rfr         : risk-free rate
+    K_target    : strike at which to evaluate IV
+    K_atm_near  : near-term ATM strike (used to decide call vs put)
+    """
+    near_strikes = near_df["strike"].values
+    idx = np.argmin(np.abs(near_strikes - K_target))
+    K_nearest = near_strikes[idx]
+    row = near_df[near_df["strike"] == K_nearest].iloc[0]
+    
+    # Use call if K >= K_atm (in the money on calls side), else put
+    if K_target >= K_atm_near:
+        price = row["cmid"] if not math.isnan(row["cmid"]) else row["pmid"]
+        is_call = True
+    else:
+        price = row["pmid"] if not math.isnan(row["pmid"]) else row["cmid"]
+        is_call = False
+    
+    if math.isnan(price) or price <= 0:
+        return 0.0
+    
+    iv = bs_iv(price, F, K_nearest, T, rfr, is_call=is_call)
+    return iv
+
+
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
     Run 6-factor VIX decomposition between two consecutive dates.
     Uses the 30-day interpolated skew methodology from the CBOE whitepaper.
 
-    All 5 bugs fixed:
-    - Bug 1: Iterative delta-to-strike using actual IV from near-term skew
-    - Bug 2: F1 = OLD_30d_put_vol_at_NEW_spot - OLD_ATM_vol (uses prev day's skew)
-    - Bug 3: F3 from put skew at K_put30, F4 from call skew at K_call30
-    - Bug 4: F5 from put skew at K_put10, F6 from call skew at K_call10
-    - Bug 5: Single-strike approximation documented (full aggregation requires
-             recomputing VIX after adjusting ALL 15-45 delta puts)
+    Methodology (Whitepaper P13-P22):
+    - F1: vol_old(S_new) - vol_old(S_old), OLD near-term near-ATM IV at S_new
+    - F2: vol_new(S_new) - vol_old(S_new), NEW near-term near-ATM IV at S_new
+    - F3: put skew gradient at 30-delta put strike (single-strike approx)
+    - F4: call skew gradient at 30-delta call strike (single-strike approx)
+    - F5: downside convexity at 10-delta put strike (single-strike approx)
+    - F6: upside convexity at 10-delta call strike (single-strike approx)
     """
     # ── Unpack 30d skews ───────────────────────────────────────────────────
     put_old = prev.get("put_skew_30d", {})
@@ -627,15 +669,27 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     prev_IV1 = prev["IV1"]
     prev_atm_vol = prev_IV1  # ATM vol from previous date
 
-    # ── BUG 2 FIX: F1 = OLD_30d_put_vol_at_NEW_spot - OLD_ATM_vol ─────────
-    # OLD 30d put skew evaluated at S_new (the NEW spot), minus OLD ATM vol
-    vol_at_S_new_from_old = get_vol_at_strike(put_old, S_new)
-    F1 = vol_at_S_new_from_old - prev_atm_vol
+    # ── F1: Sticky Strike ──────────────────────────────────────────────────
+    # F1 = vol_old(S_new) - vol_old(S_old) per whitepaper P13 Eq 4
+    # Where "vol_old(S)" = OLD near-term near-ATM IV at strike S
+    # This uses the RAW near-term chain IV (not 30d interpolated), from the
+    # OLD near-term near-ATM option type (call if K>=K_atm, put if K<K_atm)
+    # evaluated at the NEW near-term near-ATM strike.
+    vol_old_at_S_new = get_near_term_vol_at_strike(
+        prev["chain1_df"], prev["F"], prev["T1"], prev["rfr"],
+        S_new, K_atm_old
+    )
+    F1 = vol_old_at_S_new - prev_atm_vol
 
     # ── F2: Parallel Shift ─────────────────────────────────────────────────
-    # NEW 30d put skew evaluated at S_new, minus OLD 30d put skew at S_new
-    vol_at_S_new_from_new = get_vol_at_strike(put_new, S_new)
-    F2 = vol_at_S_new_from_new - vol_at_S_new_from_old
+    # F2 = vol_new(S_new) - vol_old(S_new) per whitepaper P18 Eq 5
+    # Both evaluated at the same strike (S_new) on new vs old skews.
+    # Uses the NEW near-term near-ATM call/put IV at S_new.
+    vol_new_at_S_new = get_near_term_vol_at_strike(
+        curr["chain1_df"], curr["F"], curr["T1"], curr["rfr"],
+        S_new, curr["K_atm1"]
+    )
+    F2 = vol_new_at_S_new - vol_old_at_S_new
 
     # ── Delta strikes using iterative approach (BUG 1 FIX) ─────────────────
     # Use current day's near/far data to find strikes for target deltas
