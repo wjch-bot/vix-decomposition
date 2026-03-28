@@ -42,23 +42,39 @@ This applies both to the main variance computation and to the tail (F5/F6) calcu
 ### `get_near_term_vol_at_strike` — REMOVE
 This function reads raw near-term IV. After interpolation, we NEVER touch near-term or far-term chains again. Delete this function entirely.
 
-### F1 and F2 — Correct them:
-- **F1:** On the OLD date's blended skew, at strike = NEW spot, read the 30d vol. Subtract OLD blended ATM vol. = `σ30_old(S_new) − σ30_old(S_old_ATM)`
-- **F2:** At strike = NEW spot on NEW blended skew, minus at same strike on OLD blended skew. = `σ30_new(S_new) − σ30_old(S_new)`
+### F1 and F2 — Use blended 30d vol only:
+- **F1:** On the OLD date's blended skew, at strike = NEW spot, read the 30d blended vol. Subtract OLD blended ATM vol. = `σ30_old(S_new) − σ30_old(S_old_ATM)`
+- **F2:** At the same strike (NEW spot) on NEW blended skew, minus OLD blended vol at that strike. = `σ30_new(S_new) − σ30_old(S_new)`
+- Both use the blended 30d skew surface. The "near-term near-ATM" language from the old code is incorrect — there is no near-term after interpolation.
 
 Both F1 and F2 should use the BLENDED 30d vol surface, NOT the raw near-term chain.
 
-### F3 and F4 — Not 30-delta proxy:
-The whitepaper uses the actual 30d vol surface to find the strikes. For each date:
-- Find the strike K such that `N(d1) = 0.30` (call wing) and `N(d1)−1 = −0.30` (put wing) on the 30d blended skew.
-- F3 = change in 30d put skew at the 30-delta put strike (not a "gradient" — just the raw change in vol at that strike between dates, minus F2)
-- F4 = change in 30d call skew at the 30-delta call strike (same logic)
-- Use `find_strike_for_delta` with blended σ30 dict (already partially done, but confirm it's using blended not raw)
+### F3 and F4 — 15 to 45 delta bucket (inclusive), inversely strike-weighted:
+Per the whitepaper, F3 and F4 use a DELTA BUCKET (not a single strike):
+- F3 (put skew): all strikes in the 15–45 delta bucket (i.e., signed delta in [−0.45, −0.15])
+- F4 (call skew): all strikes in the 15–45 delta bucket (i.e., signed delta in [0.15, 0.45])
+- For each date, find ALL strikes within the bucket. Weight each strike's vol contribution by `1/K²` (inversely proportional to strike squared), same as the VIX formula.
+- F3 = weighted_avg_vol_bucket(put_new, [−0.45, −0.15]) − weighted_avg_vol_bucket(put_old, [−0.45, −0.15]) − F2
+- F4 = same for calls
+- The whitepaper calls this "skew" — it is a weighted average vol in the bucket, not a single-strike delta proxy.
 
-### F5 and F6 — Not 10-delta:
-- F5 = vol change at the 10-delta put strike minus F2 minus F3 (downside convexity)
-- F6 = vol change at the 10-delta call strike minus F2 minus F4 (upside convexity)
-- Same: read from blended 30d skew dict, not raw chains.
+### F5 and F6 — 1 to −15 delta bucket (inclusive lower, exclusive upper), inversely strike-weighted:
+- F5 (downside convexity): delta bucket [−0.15, −0.01] (i.e., signed delta > −0.15 and ≤ −0.01, or equivalently: 1 ≥ |delta| > 0.01)
+- F6 (upside convexity): delta bucket [0.01, 0.15] (i.e., signed delta in [0.01, 0.15])
+- Same inversely strike-weighted average (`1/K²`) approach.
+- F5 = weighted_avg_vol_bucket(put_new, [−0.15, −0.01]) − weighted_avg_vol_bucket(put_old, [−0.15, −0.01]) − F2 − F3
+- F6 = same for calls
+
+### Delta convention:
+- Put signed delta = `N(d1) − 1` (ranges 0 to −1)
+- Call signed delta = `N(d1)` (ranges 0 to +1)
+- 45-delta put = −0.45, 15-delta put = −0.15
+- 1-delta put = −0.01, 15-delta call = +0.15
+
+### Strike-finding for delta buckets:
+- For each bucket boundary (e.g., −0.45, −0.15, −0.01, 0.01, 0.15), find the strike K that gives that signed delta using the 30d blended vol surface and Brent's method.
+- Then collect all strikes in the blended skew dict that fall between those delta bounds.
+- Compute the weighted average vol using `Σ(ΔK/K² × vol)` / `Σ(ΔK/K²)`.
 
 ### `build_30day_skew` — Cubic spline instead of linear:
 - After building the variance-interpolated vol dict, fit a `CubicSpline` to get a continuous vol surface.
@@ -68,6 +84,16 @@ The whitepaper uses the actual 30d vol surface to find the strikes. For each dat
 Confirm it uses blended σ30 dict (not raw near-term). The current code may still have old references to `near_df` / `far_df`.
 
 ---
+
+### Prerequisite for P3: Clean up old incorrect code
+Before rewriting, delete or comment out ALL old incorrect implementations so they don't cause confusion:
+- Delete `get_near_term_vol_at_strike` (uses raw near-term IV, wrong)
+- Delete or gut `find_strike_for_delta` and `_delta_func` (was for single-strike, not buckets)
+- Delete `get_vol_at_strike_from_df` (uses raw near-term chain, wrong)
+- Delete `compute_atm_iv` (no longer needed after removing near/far usage)
+- Delete any commented-out old F1/F2/F3/F4/F5/F6 calculations
+- Rewrite `run_decomposition` from scratch using the correct methodology above.
+- Make sure NO function in the final code references `near_df`, `far_df`, `chain1_df`, `chain2_df`, `DTE1`, `DTE2`, `IV1`, `IV2` after the blended skew is built.
 
 ## Deliverables
 1. Fix P1: Apply CBOE zero-bid truncation rule. Regenerate CSV.
