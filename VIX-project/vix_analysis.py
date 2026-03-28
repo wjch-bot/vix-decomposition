@@ -22,10 +22,31 @@ from scipy.optimize import brentq
 
 from vix_decomposition import decompose_vix_manual, VIXDecomposition
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# FACTOR GENERATION & HELPER FUNCTIONS
+# -------------------------------------------------------------------
+# Factor generation (6-factor VIX decomposition):
+#   run_decomposition()           → F1-F6 computation
+#   get_near_term_vol_at_strike() → F1 & F2: raw near-term IV at a strike
+#   find_strike_for_delta()        → F3-F6: delta-to-strike conversion
+#   _delta_func()                  → objective for find_strike_for_delta()
+#
+# Skew & interpolation helpers:
+#   build_30day_skew()            → 30d interpolated put/call skew surface
+#   get_vol_at_strike()            → linear vol interpolation from skew dict
+#   get_vol_at_strike_from_df()   → vol at strike from raw chain DataFrame
+#
+# IV & VIX helpers:
+#   bs_iv()                        → Black-Scholes implied vol (brentq)
+#   _bs_call(), _bs_put()          → Black-Scholes price formulas
+#   compute_vix_variance()         → CBOE variance for one expiry
+#   compute_atm_iv()              → ATM IV from chain DataFrame
+#   compute_forward()              → forward price via put-call parity
+#   build_chain_df()              → raw optionchain → DataFrame with mids
+#   find_nearest_expiries()       → near/far expiry selection (DTE <= 30 / > 30)
+# =============================================================================
 
+# CONFIG
 def load_env():
     # .env is in the parent of the VIX-project directory
     path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
@@ -42,10 +63,7 @@ ENV = load_env()
 SUPABASE_URL = ENV["SUPABASE_URL"]
 SUPABASE_KEY = ENV["SUPABASE_SERVICE_KEY"]
 
-# ─────────────────────────────────────────────────────────────────────────────
 # BLACK-SCHOLES IV (copied from /tmp/tastytrade-bot/methods.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _bs_call(F: float, K: float, T: float, sigma: float, rfr: float) -> float:
     if sigma <= 0 or T <= 0:
         return max(F - K, 0.0) * math.exp(-rfr * T)
@@ -53,14 +71,12 @@ def _bs_call(F: float, K: float, T: float, sigma: float, rfr: float) -> float:
     d2 = d1 - sigma * math.sqrt(T)
     return math.exp(-rfr * T) * (F * norm.cdf(d1) - K * norm.cdf(d2))
 
-
 def _bs_put(F: float, K: float, T: float, sigma: float, rfr: float) -> float:
     if sigma <= 0 or T <= 0:
         return max(K - F, 0.0) * math.exp(-rfr * T)
     d1 = (math.log(F / K) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return math.exp(-rfr * T) * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
-
 
 def bs_iv(price: float, F: float, K: float, T: float, rfr: float,
           is_call: bool = True) -> float:
@@ -78,11 +94,7 @@ def bs_iv(price: float, F: float, K: float, T: float, rfr: float,
         iv = 0.0
     return iv * 100.0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DATA FETCHING
-# ─────────────────────────────────────────────────────────────────────────────
-
 def fetch_snapshots_2026():
     """Fetch PM snapshots for dates >= 2026-01-01."""
     url = f"{SUPABASE_URL}/rest/v1/market_snapshots"
@@ -100,11 +112,7 @@ def fetch_snapshots_2026():
     resp.raise_for_status()
     return resp.json()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VIX COMPUTATION — CORE
-# ─────────────────────────────────────────────────────────────────────────────
-
+# VIX COMPUTATION
 def build_chain_df(optionchain_list: list) -> pd.DataFrame:
     """Convert raw optionchain list rows into a clean DataFrame with mid prices."""
     rows = []
@@ -124,7 +132,6 @@ def build_chain_df(optionchain_list: list) -> pd.DataFrame:
     df = df.sort_values("strike").reset_index(drop=True)
     return df
 
-
 def compute_forward(df: pd.DataFrame, K_atm: float, rfr: float, T: float) -> float:
     """Compute forward price via put-call parity at ATM strike."""
     atm_row = df[df["strike"] == K_atm]
@@ -137,7 +144,6 @@ def compute_forward(df: pd.DataFrame, K_atm: float, rfr: float, T: float) -> flo
     if math.isnan(pmid): pmid = 0.0
     F = K_atm + math.exp(rfr * T) * (cmid - pmid)
     return F
-
 
 def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> float:
     """
@@ -190,7 +196,6 @@ def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> fl
     var = sum_term - forward_adj
     return max(var, 0.0)
 
-
 def compute_atm_iv(df: pd.DataFrame, F: float, K_atm: float,
                   rfr: float, T: float) -> float:
     """Compute ATM IV (%) from chain DataFrame using BS IV on mid prices."""
@@ -210,7 +215,6 @@ def compute_atm_iv(df: pd.DataFrame, F: float, K_atm: float,
         iv_p = bs_iv(pmid, F, K_atm, T, rfr, is_call=False)
         if iv_p > 0: ivs.append(iv_p)
     return np.mean(ivs) if ivs else 0.0
-
 
 def find_nearest_expiries(optionchain: dict, snapshot_date: date,
                           target_dte: int = 30):
@@ -256,7 +260,6 @@ def find_nearest_expiries(optionchain: dict, snapshot_date: date,
         far = results[-1]
 
     return [near, far]
-
 
 def compute_vix_for_snapshot(spot: float, rfr: float,
                                optionchain: dict,
@@ -346,11 +349,7 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
         "vix_actual": None,   # filled in later
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 30-DAY INTERPOLATED SKEW BUILDING (corrected methodology)
-# ─────────────────────────────────────────────────────────────────────────────
-
+# SKEW & INTERPOLATION
 def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
                      dte_near: int, dte_far: int,
                      spot: float, F_near: float, F_far: float,
@@ -446,7 +445,6 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
 
     return put_skew_30d, call_skew_30d
 
-
 def get_vol_at_strike(skew_dict: dict[float, float], target_strike: float) -> float:
     """
     Linearly interpolate vol at target_strike from a skew dict (strike→vol).
@@ -469,7 +467,6 @@ def get_vol_at_strike(skew_dict: dict[float, float], target_strike: float) -> fl
             return v_lo + t * (v_hi - v_lo)
     return 0.0
 
-
 def get_vol_at_strike_from_df(near_df: pd.DataFrame, K: float, F: float,
                                 T: float, rfr: float, side: str) -> float:
     """
@@ -489,11 +486,6 @@ def get_vol_at_strike_from_df(near_df: pd.DataFrame, K: float, F: float,
         return 0.0
     iv = bs_iv(price, F, K_nearest, T, rfr, is_call=(side == 'call'))
     return iv
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG 1 FIX: Iterative delta-to-strike finder using actual IV from skew
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _delta_func(K: float, target_delta: float, S: float,
                 near_df: pd.DataFrame, F: float, T_near: float,
@@ -517,7 +509,6 @@ def _delta_func(K: float, target_delta: float, S: float,
     else:
         signed_delta = norm.cdf(d1)         # ranges 0 to 1
     return signed_delta - target_delta
-
 
 def find_strike_for_delta(target_delta: float, S: float,
                           near_df: pd.DataFrame, far_df: pd.DataFrame,
@@ -557,10 +548,8 @@ def find_strike_for_delta(target_delta: float, S: float,
     if side == 'put':
         # For puts: K < S (OTM puts have negative delta from -1 to 0)
         # target_delta is negative (e.g., -0.10 for 10-delta put)
-        # delta is monotonic in K: at K=S, delta≈-0.5; as K→0, delta→0
         K_lo = 0.5 * S
         K_hi = S
-        # Verify bracket: at K_lo delta≈0 (side→0), at K_hi delta≈-0.5
         f_lo = _delta_func(K_lo, target_delta, S, near_df, F, T_near, rfr, side)
         f_hi = _delta_func(K_hi, target_delta, S, near_df, F, T_near, rfr, side)
     else:
@@ -591,11 +580,7 @@ def find_strike_for_delta(target_delta: float, S: float,
             K = S * math.exp(-sigma * math.sqrt(T) * inv + 0.5 * sigma ** 2 * T)
         return max(K, 0.5 * S)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VIX DECOMPOSITION (all 5 bugs fixed)
-# ─────────────────────────────────────────────────────────────────────────────
-
+# FACTOR GENERATION
 def get_near_term_vol_at_strike(
     near_df: pd.DataFrame, F: float, T: float, rfr: float,
     K_target: float, K_atm_near: float
@@ -636,7 +621,6 @@ def get_near_term_vol_at_strike(
     
     iv = bs_iv(price, F, K_nearest, T, rfr, is_call=is_call)
     return iv
-
 
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
@@ -691,7 +675,6 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     )
     F2 = vol_new_at_S_new - vol_old_at_S_new
 
-    # ── Delta strikes using iterative approach (BUG 1 FIX) ─────────────────
     # Use current day's near/far data to find strikes for target deltas
     # Signed delta convention: puts = N(d1)-1 (negative), calls = N(d1) (positive)
     curr_near_df = curr["chain1_df"]
@@ -743,7 +726,6 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
         side='call'
     )
 
-    # ── BUG 3 FIX: F3 = put skew at K_put30, F4 = call skew at K_call30 ───
     # F3: Put Skew Gradient (30-delta put strike)
     vol_put30_old = get_vol_at_strike(put_old, K_put30)
     vol_put30_new = get_vol_at_strike(put_new, K_put30)
@@ -756,7 +738,6 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     F4_raw_call_change = vol_call30_new - vol_call30_old
     F4 = F4_raw_call_change - F2
 
-    # ── BUG 4 FIX: F5 = put skew at K_put10, F6 = call skew at K_call10 ───
     # F5: Downside Convexity (10-delta put strike)
     vol_put10_old = get_vol_at_strike(put_old, K_put10)
     vol_put10_new = get_vol_at_strike(put_new, K_put10)
@@ -786,11 +767,7 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
         factor6_upside_conv=F6,
     )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CBOE VALIDATION
-# ─────────────────────────────────────────────────────────────────────────────
-
+# CBOE DATA
 def fetch_cboe_vix_historical():
     """Fetch VIX daily closing values from CBOE CSV."""
     try:
@@ -814,11 +791,7 @@ def fetch_cboe_vix_historical():
     except Exception as e:
         return {}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     print("Fetching 2026+ PM snapshots from Supabase...")
     snapshots = fetch_snapshots_2026()
@@ -1131,7 +1104,6 @@ def main():
         plt.close()
     except Exception as e:
         print(f"Chart generation failed (non-critical): {e}")
-
 
 if __name__ == "__main__":
     main()

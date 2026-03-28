@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.log
+output/vix_analysis.py
+output/vix_results.txt
