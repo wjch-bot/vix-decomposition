@@ -455,155 +455,182 @@ def get_vol_at_strike(skew_dict: dict[float, float], target_strike: float) -> fl
     cs = CubicSpline(strikes, vols, bc_type="natural")
     return float(cs(target_strike))
 
-def _delta_func(K: float, target_delta: float, S: float,
-                skew_dict: dict, T30: float, side: str) -> float:
-    if K <= 0:
+# ─────────────────────────────────────────────────────────────────────────────
+# DELTA-BUCKET SKEW FACTORS (F3–F6)
+# ─────────────────────────────────────────────────────────────────────────────
+# Signed delta conventions:
+#   put  delta = N(d1) − 1   (negative)
+#   call delta = N(d1)       (positive)
+#
+# Bucket definitions (all inclusive on lower bound, exclusive on upper unless noted):
+#   F3 put shoulder  : [−0.45, −0.15]
+#   F4 call shoulder : [+0.15, +0.45]
+#   F5 put wing      : [−0.15, −0.01)   exclusive upper
+#   F6 call wing     : [+0.01, +0.15]
+#
+# Weight at each strike: w(K) = ΔK / K²
+#   interior strikes: ΔK = (K_{i+1} − K_{i−1}) / 2
+#   lowest strike   : ΔK = K_{lo+1} − K_{lo}
+#   highest strike  : ΔK = K_{hi} − K_{hi−1}
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _signed_delta(K: float, S: float, vol30: float, T30: float,
+                  side: str) -> float:
+    """Compute signed delta for a given strike on the blended 30d surface."""
+    if K <= 0 or vol30 <= 0:
         return float('inf')
-    vol30 = get_vol_at_strike(skew_dict, K)
-    if vol30 <= 0:
-        return float('inf')
-    iv_decimal = vol30 / 100.0
+    sigma = vol30 / 100.0
     sqrt_T30 = math.sqrt(T30)
-    d1 = (math.log(S / K) + 0.5 * iv_decimal ** 2 * T30) / (iv_decimal * sqrt_T30)
+    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T30) / (sigma * sqrt_T30)
     if side == 'put':
-        signed_delta = norm.cdf(d1) - 1.0
+        return norm.cdf(d1) - 1.0
     else:
-        signed_delta = norm.cdf(d1)
-    return signed_delta - target_delta
+        return norm.cdf(d1)
 
 
-def find_strike_for_delta(target_delta: float, S: float,
-                          put_skew_30d: dict, call_skew_30d: dict,
-                          T30: float,
-                          side: str = 'put') -> float:
-    skew_dict = put_skew_30d if side == 'put' else call_skew_30d
-    if not skew_dict:
-        return S
+def _find_bucket_bound(target_delta: float, S: float, T30: float,
+                       skew_dict: dict, side: str) -> float | None:
+    """Use Brent's method to find strike K such that signed_delta(K) = target_delta."""
     strikes = sorted(skew_dict.keys())
+    if not strikes:
+        return None
     K_lo = max(strikes[0], 0.5 * S)
     K_hi = min(strikes[-1], 2.0 * S)
+
+    def objective(K):
+        vol = get_vol_at_strike(skew_dict, K)
+        return _signed_delta(K, S, vol, T30, side) - target_delta
+
     try:
-        return float(brentq(
-            lambda K: _delta_func(K, target_delta, S, skew_dict, T30, side),
-            K_lo, K_hi, xtol=1.0, maxiter=100
-        ))
+        lo_val = objective(K_lo)
+        hi_val = objective(K_hi)
+        if lo_val * hi_val > 0:
+            return None  # no bracket
+        return float(brentq(objective, K_lo, K_hi, xtol=0.5, maxiter=200))
     except (ValueError, RuntimeError):
-        sigma = get_vol_at_strike(skew_dict, S) / 100.0
-        if side == 'put':
-            inv = norm.ppf(max(1e-6, min(1.0 - target_delta, 1 - 1e-6)))
-            K = S * math.exp(sigma * math.sqrt(T30) * inv + 0.5 * sigma ** 2 * T30)
-        else:
-            inv = norm.ppf(max(1e-6, min(target_delta, 1 - 1e-6)))
-            K = S * math.exp(-sigma * math.sqrt(T30) * inv + 0.5 * sigma ** 2 * T30)
-        return max(K, 0.5 * S)
+        return None
+
+
+def _bucket_weighted_avg_vol_change(
+    skew_old: dict, skew_new: dict,
+    S: float, T30: float, side: str,
+    delta_lo: float, delta_hi: float
+) -> float | None:
+    """
+    Compute the 1/K²-weighted average vol change across all strikes in a delta bucket.
+
+    Returns weighted_avg(vol_new(K) - vol_old(K)) for all strikes K where
+    delta_lo <= signed_delta(K) <= delta_hi, or None if bucket is empty.
+
+    Weight at each strike: ΔK / K²  (CBOE VIX structural weighting)
+    """
+    # Collect ALL strikes from both old and new skews (union) as numpy array
+    all_strikes = np.array(sorted(set(skew_old.keys()) | set(skew_new.keys())))
+
+    # Compute ΔK half-gap array (same as CBOE variance formula)
+    n = len(all_strikes)
+    dK = np.empty(n, dtype=float)
+    dK[0]     = all_strikes[1] - all_strikes[0]
+    dK[-1]    = all_strikes[-1] - all_strikes[-2]
+    dK[1:-1]  = (all_strikes[2:] - all_strikes[:-2]) / 2.0
+
+    numerator   = 0.0   # Σ(ΔK/K² × Δvol)
+    denominator = 0.0   # Σ(ΔK/K²)
+
+    for i, K in enumerate(all_strikes):
+        vol_old = get_vol_at_strike(skew_old, K)
+        vol_new = get_vol_at_strike(skew_new, K)
+        delta = _signed_delta(K, S, (vol_new + vol_old) / 2.0, T30, side)
+
+        if not (delta_lo <= delta <= delta_hi):
+            continue
+        if K <= 0:
+            continue
+
+        weight = dK[i] / (K ** 2)
+        dvol = vol_new - vol_old
+        numerator   += weight * dvol
+        denominator += weight
+
+    if denominator <= 0:
+        return None
+
+    return numerator / denominator
+
 
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
-    Run 6-factor VIX decomposition between two consecutive dates.
-    Uses the 30-day blended skew methodology from the CBOE whitepaper.
+    6-factor VIX decomposition using the 30d blended skew surface.
 
-    After building the 30d blended skew surface, only the blended dicts are used.
-    Near/far chains are never referenced for decomposition.
+    After building the 30d blended skew on each date, the near/far chains are
+    never referenced again. All factors operate on the blended put/call skew dicts.
 
-    Methodology (Whitepaper P13-P22):
-    - F1: σ30_old(S_new) − σ30_old(S_old_ATM)  [blended vol, sticky strike]
-    - F2: σ30_new(S_new) − σ30_old(S_new)         [blended vol, parallel shift]
-    - F3: put skew gradient at 30-delta put strike (single-strike approx)
-    - F4: call skew gradient at 30-delta call strike (single-strike approx)
-    - F5: downside convexity at 10-delta put strike (single-strike approx)
-    - F6: upside convexity at 10-delta call strike (single-strike approx)
+    F1  Sticky Strike  : σ30_old(S_new) − σ30_old(S_old)
+    F2  Parallel Shift : σ30_new(S_new) − σ30_old(S_new)
+    F3  Put Shoulder   : [−0.45, −0.15] bucket avg Δvol − F2
+    F4  Call Shoulder  : [+0.15, +0.45] bucket avg Δvol − F2
+    F5  Put Wing       : [−0.15, −0.01) bucket avg Δvol − F2 − F3
+    F6  Call Wing      : [+0.01, +0.15] bucket avg Δvol − F2 − F4
+
+    Bucket weights: ΔK/K²  (CBOE structural weighting)
     """
-    # ── Unpack 30d skews ───────────────────────────────────────────────────
-    put_old = prev.get("put_skew_30d", {})
-    put_new = curr.get("put_skew_30d", {})
+    put_old  = prev.get("put_skew_30d", {})
+    put_new  = curr.get("put_skew_30d", {})
     call_old = prev.get("call_skew_30d", {})
     call_new = curr.get("call_skew_30d", {})
 
     if not put_old or not put_new or not call_old or not call_new:
         return None
 
-    # ── Spot prices ────────────────────────────────────────────────────────
     S_old = prev["spot"]
     S_new = curr["spot"]
+    T30   = 30.0 / 365.0
 
-    # ── F1: Sticky Strike ──────────────────────────────────────────────────
-    # F1 = σ30_old(S_new) − σ30_old(S_old_ATM)
-    # Read OLD blended 30d vol at NEW spot strike (using both put and call sides)
-    # and subtract the OLD blended ATM vol (vol at old spot on old blended skew).
+    # ── F1: Sticky Strike ─────────────────────────────────────────────────
+    # σ30 at NEW spot on OLD blended skew, minus σ30 at OLD spot on OLD blended skew.
     if S_new < S_old:
-        # spot moved down → use put skew for both
         vol_old_at_S_new = get_vol_at_strike(put_old, S_new)
-        vol_old_atm_old = get_vol_at_strike(put_old, S_old)
+        vol_old_atm_old  = get_vol_at_strike(put_old, S_old)
     else:
-        # spot moved up → use call skew for both
         vol_old_at_S_new = get_vol_at_strike(call_old, S_new)
-        vol_old_atm_old = get_vol_at_strike(call_old, S_old)
+        vol_old_atm_old  = get_vol_at_strike(call_old, S_old)
     F1 = vol_old_at_S_new - vol_old_atm_old
 
     # ── F2: Parallel Shift ─────────────────────────────────────────────────
-    # F2 = σ30_new(S_new) − σ30_old(S_new)
-    # Read NEW blended 30d vol at S_new minus OLD blended 30d vol at S_new.
+    # σ30 at NEW spot on NEW blended skew, minus σ30 at same strike on OLD skew.
     if S_new < S_old:
         vol_new_at_S_new = get_vol_at_strike(put_new, S_new)
     else:
         vol_new_at_S_new = get_vol_at_strike(call_new, S_new)
     F2 = vol_new_at_S_new - vol_old_at_S_new
 
-    T30 = 30.0 / 365.0
-
-    K_put30 = find_strike_for_delta(
-        -0.30, S_new,
-        put_new, call_new, T30,
-        side='put'
+    # ── F3: Put Shoulder  [−0.45, −0.15] ───────────────────────────────────
+    F3_raw = _bucket_weighted_avg_vol_change(
+        put_old, put_new, S_new, T30, 'put', -0.45, -0.15
     )
+    F3 = (F3_raw - F2) if F3_raw is not None else 0.0
 
-    K_call30 = find_strike_for_delta(
-        0.30, S_new,
-        put_new, call_new, T30,
-        side='call'
+    # ── F4: Call Shoulder  [+0.15, +0.45] ───────────────────────────────────
+    F4_raw = _bucket_weighted_avg_vol_change(
+        call_old, call_new, S_new, T30, 'call', 0.15, 0.45
     )
+    F4 = (F4_raw - F2) if F4_raw is not None else 0.0
 
-    K_put10 = find_strike_for_delta(
-        -0.10, S_new,
-        put_new, call_new, T30,
-        side='put'
+    # ── F5: Put Wing  [−0.15, −0.01) ───────────────────────────────────────
+    F5_raw = _bucket_weighted_avg_vol_change(
+        put_old, put_new, S_new, T30, 'put', -0.15, -0.01
     )
+    F5 = (F5_raw - F2 - F3) if F5_raw is not None else 0.0
 
-    K_call10 = find_strike_for_delta(
-        0.10, S_new,
-        put_new, call_new, T30,
-        side='call'
+    # ── F6: Call Wing  [+0.01, +0.15] ───────────────────────────────────────
+    F6_raw = _bucket_weighted_avg_vol_change(
+        call_old, call_new, S_new, T30, 'call', 0.01, 0.15
     )
+    F6 = (F6_raw - F2 - F4) if F6_raw is not None else 0.0
 
-    # F3: Put Skew Gradient (30-delta put strike)
-    vol_put30_old = get_vol_at_strike(put_old, K_put30)
-    vol_put30_new = get_vol_at_strike(put_new, K_put30)
-    F3_raw_put_change = vol_put30_new - vol_put30_old
-    F3 = F3_raw_put_change - F2
-
-    # F4: Call Skew Gradient (30-delta call strike)
-    vol_call30_old = get_vol_at_strike(call_old, K_call30)
-    vol_call30_new = get_vol_at_strike(call_new, K_call30)
-    F4_raw_call_change = vol_call30_new - vol_call30_old
-    F4 = F4_raw_call_change - F2
-
-    # F5: Downside Convexity (10-delta put strike)
-    vol_put10_old = get_vol_at_strike(put_old, K_put10)
-    vol_put10_new = get_vol_at_strike(put_new, K_put10)
-    F5_raw = vol_put10_new - vol_put10_old
-    F5 = F5_raw - F2 - F3
-
-    # F6: Upside Convexity (10-delta call strike)
-    vol_call10_old = get_vol_at_strike(call_old, K_call10)
-    vol_call10_new = get_vol_at_strike(call_new, K_call10)
-    F6_raw = vol_call10_new - vol_call10_old
-    F6 = F6_raw - F2 - F4
-
-    # ── VIX change ground truth ────────────────────────────────────────────
-    VIX_old = prev.get("vix_computed", 0.0)
-    VIX_new = curr.get("vix_computed", 0.0)
-    VIX_old_actual = prev.get("vix_actual", VIX_old) or VIX_old
-    VIX_new_actual = curr.get("vix_actual", VIX_new) or VIX_new
+    # ── Ground truth ────────────────────────────────────────────────────────
+    VIX_old_actual = prev.get("vix_actual") or prev.get("vix_computed", 0.0)
+    VIX_new_actual = curr.get("vix_actual") or curr.get("vix_computed", 0.0)
     total = VIX_new_actual - VIX_old_actual
 
     return VIXDecomposition(
