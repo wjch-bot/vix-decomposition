@@ -149,6 +149,14 @@ def compute_forward(df: pd.DataFrame, spot: float, rfr: float, T: float) -> floa
     if math.isnan(pmid): pmid = 0.0
     return K_atmf + math.exp(rfr * T) * (cmid - pmid)
 
+def _is_zero_quote(row: dict) -> bool:
+    cbid = row.get("cbid", 0) or 0
+    cask = row.get("cask", 0) or 0
+    pbid = row.get("pbid", 0) or 0
+    pask = row.get("pask", 0) or 0
+    return (cbid == 0 or cask == 0) and (pbid == 0 or pask == 0)
+
+
 def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> float:
     """
     Compute variance σ² for a single expiry using the full CBOE formula.
@@ -157,59 +165,67 @@ def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> fl
 
     Where Q(K) is the actual option mid price (not discounted).
 
-    CBOE zero-bid truncation: Only include strikes within a reasonable
-    moneyness range (0.5*F to 2.0*F). This approximates the "two consecutive
-    zero bid" rule: deeply OTM puts (K << F) and deeply OTM calls (K >> F)
-    have zero bid prices in practice and are excluded from the calculation.
+    CBOE zero-bid truncation: starting from ATM (K₀), walk outward in both
+    directions. A strike is excluded when TWO CONSECUTIVE strikes have zero bid
+    OR zero ask in either direction. The last valid strike before those two is
+    included.
     """
-    strikes = df["strike"].values
-    cmids = df["cmid"].values
-    pmids = df["pmid"].values
-
-    # CBOE zero-bid truncation: moneyness filter (0.5*F to 2.0*F)
-    # This excludes deeply OTM puts (K << F) and deeply OTM calls (K >> F)
-    # which have zero bid prices in practice.
-    valid_mask = (strikes >= 0.5 * F) & (strikes <= 2.0 * F)
-    strikes = strikes[valid_mask]
-    cmids = cmids[valid_mask]
-    pmids = pmids[valid_mask]
-
-    # Find K0: first strike <= F
-    K0_candidates = strikes[strikes <= F]
-    if len(K0_candidates) == 0:
+    raw = df[["strike", "cmid", "pmid", "cbid", "cask", "pbid", "pask"]].to_dict("records")
+    if not raw:
         return 0.0
-    K0 = K0_candidates[-1]
 
-    # Build Q(K): put mid for K<K0, call mid for K>K0, avg for K=K0
+    K0_strike = max((r["strike"] for r in raw if r["strike"] <= F), default=None)
+    if K0_strike is None:
+        return 0.0
+
+    idx_atm = next(i for i, r in enumerate(raw) if r["strike"] == K0_strike)
+
+    valid = [True] * len(raw)
+
+    for i in range(idx_atm - 1, -1, -1):
+        if _is_zero_quote(raw[i]) and _is_zero_quote(raw[i + 1]):
+            valid[i] = False
+            break
+        valid[i] = True
+
+    for i in range(idx_atm + 1, len(raw)):
+        if _is_zero_quote(raw[i]) and _is_zero_quote(raw[i - 1]):
+            valid[i] = False
+            break
+        valid[i] = True
+
+    rows = [r for i, r in enumerate(raw) if valid[i]]
+    if len(rows) < 2:
+        return 0.0
+
+    strikes = np.array([r["strike"] for r in rows])
+    cmids   = np.array([r["cmid"] for r in rows])
+    pmids   = np.array([r["pmid"] for r in rows])
+
     Q = np.empty_like(strikes, dtype=float)
     for i, K in enumerate(strikes):
-        if K < K0:
+        if K < K0_strike:
             Q[i] = pmids[i] if not math.isnan(pmids[i]) else 0.0
-        elif K > K0:
+        elif K > K0_strike:
             Q[i] = cmids[i] if not math.isnan(cmids[i]) else 0.0
         else:
             c = cmids[i] if not math.isnan(cmids[i]) else 0.0
             p = pmids[i] if not math.isnan(pmids[i]) else 0.0
             Q[i] = (c + p) / 2.0
 
-    # Compute ΔK (strike interval using half-gap approach)
     n = len(strikes)
     dK = np.zeros(n, dtype=float)
-    dK[0] = strikes[1] - strikes[0]           # lowest strike: full gap
-    dK[-1] = strikes[-1] - strikes[-2]        # highest strike: full gap
-    dK[1:-1] = (strikes[2:] - strikes[:-2]) / 2.0  # interior: half gap each side
+    dK[0]    = strikes[1] - strikes[0]
+    dK[-1]   = strikes[-1] - strikes[-2]
+    dK[1:-1] = (strikes[2:] - strikes[:-2]) / 2.0
 
-    # Compute the summation term (Q is actual price, no e^(RT) needed)
     sum_term = 0.0
     for i in range(n):
         K = strikes[i]
         if K > 0 and Q[i] > 0:
             sum_term += (2.0 / T) * (dK[i] / (K ** 2)) * Q[i]
 
-    # Forward adjustment term
-    forward_adj = (1.0 / T) * ((F / K0 - 1) ** 2)
-
-    # Variance (ensure non-negative)
+    forward_adj = (1.0 / T) * ((F / K0_strike - 1) ** 2)
     var = sum_term - forward_adj
     return max(var, 0.0)
 
@@ -587,13 +603,15 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     T30   = 30.0 / 365.0
 
     # ── F1: Sticky Strike ─────────────────────────────────────────────────
-    # σ30 at NEW spot on OLD blended skew, minus σ30 at OLD spot on OLD blended skew.
+    # σ30 at NEW spot on OLD blended skew, minus σ30 at OLD ATM on OLD blended skew.
+    # ATM vol is the average of put and call IVs at the old ATM strike.
     if S_new < S_old:
         vol_old_at_S_new = get_vol_at_strike(put_old, S_new)
-        vol_old_atm_old  = get_vol_at_strike(put_old, S_old)
     else:
         vol_old_at_S_new = get_vol_at_strike(call_old, S_new)
-        vol_old_atm_old  = get_vol_at_strike(call_old, S_old)
+    vol_old_put_atm  = get_vol_at_strike(put_old,  S_old)
+    vol_old_call_atm = get_vol_at_strike(call_old, S_old)
+    vol_old_atm_old  = (vol_old_put_atm + vol_old_call_atm) / 2.0
     F1 = vol_old_at_S_new - vol_old_atm_old
 
     # ── F2: Parallel Shift ─────────────────────────────────────────────────
@@ -821,6 +839,7 @@ def main():
                 decomp.factor5_downside_conv,
                 decomp.factor6_upside_conv,
             ])
+            row["diff_computed"] = res["vix_computed"] - results[i - 1]["vix_computed"]
         decomp_rows.append(row)
     decomp_df = pd.DataFrame(decomp_rows)
     decomp_df.to_csv(decomp_csv_path, index=False)
