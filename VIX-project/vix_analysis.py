@@ -132,18 +132,24 @@ def build_chain_df(optionchain_list: list) -> pd.DataFrame:
     df = df.sort_values("strike").reset_index(drop=True)
     return df
 
-def compute_forward(df: pd.DataFrame, K_atm: float, rfr: float, T: float) -> float:
-    """Compute forward price via put-call parity at ATM strike."""
-    atm_row = df[df["strike"] == K_atm]
-    if atm_row.empty:
-        idx = (df["strike"] - K_atm).abs().idxmin()
-        atm_row = df.loc[[idx]]
-    cmid = float(atm_row["cmid"].iloc[0])
-    pmid = float(atm_row["pmid"].iloc[0])
+def compute_forward(df: pd.DataFrame, spot: float, rfr: float, T: float) -> float:
+    """Compute model-free forward price via put-call parity at ATM forward strike.
+
+    Finds K_atmf = strike minimizing |cmid - pmid| (model-free ATM),
+    then F = K_atmf + exp(rT) * (cmid - pmid).
+    """
+    if "cmid" not in df.columns or "pmid" not in df.columns:
+        return spot
+    pc_diff = (df["cmid"] - df["pmid"]).abs()
+    if pc_diff.empty:
+        return spot
+    idx = pc_diff.idxmin()
+    K_atmf = float(df.loc[idx, "strike"])
+    cmid = float(df.loc[idx, "cmid"])
+    pmid = float(df.loc[idx, "pmid"])
     if math.isnan(cmid): cmid = 0.0
     if math.isnan(pmid): pmid = 0.0
-    F = K_atm + math.exp(rfr * T) * (cmid - pmid)
-    return F
+    return K_atmf + math.exp(rfr * T) * (cmid - pmid)
 
 def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> float:
     """
@@ -488,96 +494,45 @@ def get_vol_at_strike_from_df(near_df: pd.DataFrame, K: float, F: float,
     return iv
 
 def _delta_func(K: float, target_delta: float, S: float,
-                near_df: pd.DataFrame, F: float, T_near: float,
-                rfr: float, side: str) -> float:
-    """
-    Objective function for delta-based strike finding.
-    Returns (computed_signed_delta - target_delta).
-    For puts: signed_delta = N(d1) - 1 (ranges 0 to -1)
-    For calls: signed_delta = N(d1) (ranges 0 to 1)
-    """
+                skew_dict: dict, T30: float, side: str) -> float:
     if K <= 0:
         return float('inf')
-    iv_at_K = get_vol_at_strike_from_df(near_df, K, F, T_near, rfr, side)
-    if iv_at_K <= 0:
+    vol30 = get_vol_at_strike(skew_dict, K)
+    if vol30 <= 0:
         return float('inf')
-    iv_decimal = iv_at_K / 100.0
-    sqrt_T = math.sqrt(T_near)
-    d1 = (math.log(S / K) + 0.5 * iv_decimal ** 2 * T_near) / (iv_decimal * sqrt_T)
+    iv_decimal = vol30 / 100.0
+    sqrt_T30 = math.sqrt(T30)
+    d1 = (math.log(S / K) + 0.5 * iv_decimal ** 2 * T30) / (iv_decimal * sqrt_T30)
     if side == 'put':
-        signed_delta = norm.cdf(d1) - 1.0  # ranges 0 to -1
+        signed_delta = norm.cdf(d1) - 1.0
     else:
-        signed_delta = norm.cdf(d1)         # ranges 0 to 1
+        signed_delta = norm.cdf(d1)
     return signed_delta - target_delta
 
+
 def find_strike_for_delta(target_delta: float, S: float,
-                          near_df: pd.DataFrame, far_df: pd.DataFrame,
-                          dte_near: int, dte_far: int,
-                          atm_vol: float, atm_k: float,
-                          F: float, rfr: float,
+                          put_skew_30d: dict, call_skew_30d: dict,
+                          T30: float,
                           side: str = 'put') -> float:
-    """
-    Find the strike K such that the option's signed delta equals `target_delta`.
-    Uses Brent's method with the actual IV from the near-term skew at each evaluation.
-
-    Signed delta convention:
-      Puts:  delta = N(d1) - 1  (ranges 0 to -1; ATM = -0.5, 10-delta put = -0.10)
-      Calls: delta = N(d1)      (ranges 0 to  1; ATM =  0.5, 10-delta call =  0.10)
-
-    Parameters
-    ----------
-    target_delta : signed target delta (e.g., -0.10 for 10-delta put, 0.10 for 10-delta call)
-    S           : spot price
-    near_df     : near-term expiry DataFrame
-    far_df      : far-term expiry DataFrame (unused, kept for API compatibility)
-    dte_near    : days to expiration for near-term
-    dte_far     : days to expiration for far-term (unused)
-    atm_vol     : near-term ATM vol in %
-    atm_k       : near-term ATM strike (unused)
-    F           : forward price
-    rfr         : risk-free rate (decimal)
-    side        : 'put' or 'call'
-
-    Returns
-    -------
-    K           : strike price
-    """
-    T_near = dte_near / 365.0
-
-    # Bracket for Brent's method
-    if side == 'put':
-        # For puts: K < S (OTM puts have negative delta from -1 to 0)
-        # target_delta is negative (e.g., -0.10 for 10-delta put)
-        K_lo = 0.5 * S
-        K_hi = S
-        f_lo = _delta_func(K_lo, target_delta, S, near_df, F, T_near, rfr, side)
-        f_hi = _delta_func(K_hi, target_delta, S, near_df, F, T_near, rfr, side)
-    else:
-        # For calls: K > S (OTM calls have positive delta from 0 to 1)
-        # target_delta is positive (e.g., 0.10 for 10-delta call)
-        K_lo = S
-        K_hi = 2.0 * S
-        f_lo = _delta_func(K_lo, target_delta, S, near_df, F, T_near, rfr, side)
-        f_hi = _delta_func(K_hi, target_delta, S, near_df, F, T_near, rfr, side)
-
-    # If bracket is invalid, fall back to moneyness-based estimate
+    skew_dict = put_skew_30d if side == 'put' else call_skew_30d
+    if not skew_dict:
+        return S
+    strikes = sorted(skew_dict.keys())
+    K_lo = max(strikes[0], 0.5 * S)
+    K_hi = min(strikes[-1], 2.0 * S)
     try:
-        K_root = brentq(
-            lambda K: _delta_func(K, target_delta, S, near_df, F, T_near, rfr, side),
+        return float(brentq(
+            lambda K: _delta_func(K, target_delta, S, skew_dict, T30, side),
             K_lo, K_hi, xtol=1.0, maxiter=100
-        )
-        return float(K_root)
+        ))
     except (ValueError, RuntimeError):
-        # Fall back to moneyness formula
-        sigma = atm_vol / 100.0
-        T = dte_near / 365.0
+        sigma = get_vol_at_strike(skew_dict, S) / 100.0
         if side == 'put':
-            d = 1.0 - target_delta  # N⁻¹ argument for puts
-            inv = norm.ppf(max(1e-6, min(d, 1 - 1e-6)))
-            K = S * math.exp(sigma * math.sqrt(T) * inv + 0.5 * sigma ** 2 * T)
+            inv = norm.ppf(max(1e-6, min(1.0 - target_delta, 1 - 1e-6)))
+            K = S * math.exp(sigma * math.sqrt(T30) * inv + 0.5 * sigma ** 2 * T30)
         else:
             inv = norm.ppf(max(1e-6, min(target_delta, 1 - 1e-6)))
-            K = S * math.exp(-sigma * math.sqrt(T) * inv + 0.5 * sigma ** 2 * T)
+            K = S * math.exp(-sigma * math.sqrt(T30) * inv + 0.5 * sigma ** 2 * T30)
         return max(K, 0.5 * S)
 
 # FACTOR GENERATION
@@ -686,43 +641,29 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     curr_F = curr["F"]
     curr_rfr = curr["rfr"]
 
-    # 30-delta put strike: signed delta = -0.30
+    T30 = 30.0 / 365.0
+
     K_put30 = find_strike_for_delta(
         -0.30, S_new,
-        curr_near_df, curr_far_df,
-        curr_dte_near, curr_dte_far,
-        curr_atm_vol, curr_atm_k,
-        curr_F, curr_rfr,
+        put_new, call_new, T30,
         side='put'
     )
 
-    # 30-delta call strike: signed delta = +0.30
     K_call30 = find_strike_for_delta(
         0.30, S_new,
-        curr_near_df, curr_far_df,
-        curr_dte_near, curr_dte_far,
-        curr_atm_vol, curr_atm_k,
-        curr_F, curr_rfr,
+        put_new, call_new, T30,
         side='call'
     )
 
-    # 10-delta put strike: signed delta = -0.10
     K_put10 = find_strike_for_delta(
         -0.10, S_new,
-        curr_near_df, curr_far_df,
-        curr_dte_near, curr_dte_far,
-        curr_atm_vol, curr_atm_k,
-        curr_F, curr_rfr,
+        put_new, call_new, T30,
         side='put'
     )
 
-    # 10-delta call strike: signed delta = +0.10
     K_call10 = find_strike_for_delta(
         0.10, S_new,
-        curr_near_df, curr_far_df,
-        curr_dte_near, curr_dte_far,
-        curr_atm_vol, curr_atm_k,
-        curr_F, curr_rfr,
+        put_new, call_new, T30,
         side='call'
     )
 
