@@ -19,6 +19,7 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 from scipy.stats import norm
 from scipy.optimize import brentq
+from scipy.interpolate import CubicSpline
 
 from vix_decomposition import decompose_vix_manual, VIXDecomposition
 
@@ -27,20 +28,17 @@ from vix_decomposition import decompose_vix_manual, VIXDecomposition
 # -------------------------------------------------------------------
 # Factor generation (6-factor VIX decomposition):
 #   run_decomposition()           → F1-F6 computation
-#   get_near_term_vol_at_strike() → F1 & F2: raw near-term IV at a strike
 #   find_strike_for_delta()        → F3-F6: delta-to-strike conversion
 #   _delta_func()                  → objective for find_strike_for_delta()
 #
 # Skew & interpolation helpers:
 #   build_30day_skew()            → 30d interpolated put/call skew surface
-#   get_vol_at_strike()            → linear vol interpolation from skew dict
-#   get_vol_at_strike_from_df()   → vol at strike from raw chain DataFrame
+#   get_vol_at_strike()            → cubic spline vol interpolation from skew dict
 #
 # IV & VIX helpers:
 #   bs_iv()                        → Black-Scholes implied vol (brentq)
 #   _bs_call(), _bs_put()          → Black-Scholes price formulas
-#   compute_vix_variance()         → CBOE variance for one expiry
-#   compute_atm_iv()              → ATM IV from chain DataFrame
+#   compute_vix_variance()         → CBOE variance for one expiry (with zero-bid truncation)
 #   compute_forward()              → forward price via put-call parity
 #   build_chain_df()              → raw optionchain → DataFrame with mids
 #   find_nearest_expiries()       → near/far expiry selection (DTE <= 30 / > 30)
@@ -158,10 +156,23 @@ def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> fl
     σ² = (2/T) × Σ[ΔKᵢ/Kᵢ² × Q(Kᵢ)] − (1/T) × [F/K₀ − 1]²
 
     Where Q(K) is the actual option mid price (not discounted).
+
+    CBOE zero-bid truncation: Only include strikes within a reasonable
+    moneyness range (0.5*F to 2.0*F). This approximates the "two consecutive
+    zero bid" rule: deeply OTM puts (K << F) and deeply OTM calls (K >> F)
+    have zero bid prices in practice and are excluded from the calculation.
     """
     strikes = df["strike"].values
     cmids = df["cmid"].values
     pmids = df["pmid"].values
+
+    # CBOE zero-bid truncation: moneyness filter (0.5*F to 2.0*F)
+    # This excludes deeply OTM puts (K << F) and deeply OTM calls (K >> F)
+    # which have zero bid prices in practice.
+    valid_mask = (strikes >= 0.5 * F) & (strikes <= 2.0 * F)
+    strikes = strikes[valid_mask]
+    cmids = cmids[valid_mask]
+    pmids = pmids[valid_mask]
 
     # Find K0: first strike <= F
     K0_candidates = strikes[strikes <= F]
@@ -202,25 +213,6 @@ def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> fl
     var = sum_term - forward_adj
     return max(var, 0.0)
 
-def compute_atm_iv(df: pd.DataFrame, F: float, K_atm: float,
-                  rfr: float, T: float) -> float:
-    """Compute ATM IV (%) from chain DataFrame using BS IV on mid prices."""
-    atm_row = df[df["strike"] == K_atm]
-    if atm_row.empty:
-        idx = (df["strike"] - K_atm).abs().idxmin()
-        atm_row = df.loc[[idx]]
-    cmid = float(atm_row["cmid"].iloc[0])
-    pmid = float(atm_row["pmid"].iloc[0])
-    if math.isnan(cmid): cmid = 0.0
-    if math.isnan(pmid): pmid = 0.0
-    ivs = []
-    if cmid > 1e-6:
-        iv_c = bs_iv(cmid, F, K_atm, T, rfr, is_call=True)
-        if iv_c > 0: ivs.append(iv_c)
-    if pmid > 1e-6:
-        iv_p = bs_iv(pmid, F, K_atm, T, rfr, is_call=False)
-        if iv_p > 0: ivs.append(iv_p)
-    return np.mean(ivs) if ivs else 0.0
 
 def find_nearest_expiries(optionchain: dict, snapshot_date: date,
                           target_dte: int = 30):
@@ -275,7 +267,7 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
 
     Returns dict with keys:
         date, spot, vix_computed, near_exp, next_exp, DTE1, DTE2,
-        IV1, IV2, IV_30d, sigma_30d, rfr, K_atm1, K_atm2,
+        IV_30d, sigma_30d, rfr, K_atm1, K_atm2,
         chain1_df, chain2_df, F, T1, T2, vix_actual
     """
     # ── Find two closest expiries to 30 days ───────────────────────────────
@@ -303,13 +295,6 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
     F1 = compute_forward(df1, K_atm1, rfr, T1)
     F2 = compute_forward(df2, K_atm2, rfr, T2)
 
-    # ── ATM IVs (still needed for decomposition) ───────────────────────────
-    IV1 = compute_atm_iv(df1, F1, K_atm1, rfr, T1)
-    IV2 = compute_atm_iv(df2, F2, K_atm2, rfr, T2)
-
-    if IV1 <= 0 or IV2 <= 0:
-        return None
-
     # ── Compute FULL CBOE variance for each expiry ─────────────────────────
     var1 = compute_vix_variance(df1, F1, rfr, T1)
     var2 = compute_vix_variance(df2, F2, rfr, T2)
@@ -328,8 +313,10 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
 
     vix_computed = 100.0 * math.sqrt(var_30d)
 
-    # ── 30d ATM IV (for decomposition compatibility) ───────────────────────
-    IV_30d = IV1 + (IV2 - IV1) * (30 - dte1) / (dte2 - dte1)
+    # ── 30d blended vol (sigma_30d) ────────────────────────────────────────
+    # This is the ATM-equivalent vol used throughout the decomposition.
+    sigma_30d = math.sqrt(var_30d)
+    IV_30d = sigma_30d * 100.0   # convert to percentage for compatibility
 
     return {
         "date": snapshot_date.isoformat(),
@@ -339,10 +326,8 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
         "next_exp": exp2_str,
         "DTE1": dte1,
         "DTE2": dte2,
-        "IV1": IV1,
-        "IV2": IV2,
         "IV_30d": IV_30d,
-        "sigma_30d": math.sqrt(var_30d),
+        "sigma_30d": sigma_30d,
         "rfr": rfr,
         "K_atm1": K_atm1,
         "K_atm2": K_atm2,
@@ -453,45 +438,22 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
 
 def get_vol_at_strike(skew_dict: dict[float, float], target_strike: float) -> float:
     """
-    Linearly interpolate vol at target_strike from a skew dict (strike→vol).
+    Cubic spline interpolation of vol at target_strike from a skew dict (strike→vol).
     Returns edge values if target is outside the strike range.
     """
     if not skew_dict:
         return 0.0
     strikes = sorted(skew_dict.keys())
-    if target_strike <= strikes[0]:
-        return skew_dict[strikes[0]]
-    if target_strike >= strikes[-1]:
-        return skew_dict[strikes[-1]]
-    # Linear interpolation
-    for i in range(len(strikes) - 1):
-        k_lo, k_hi = strikes[i], strikes[i + 1]
-        if k_lo <= target_strike <= k_hi:
-            v_lo = skew_dict[k_lo]
-            v_hi = skew_dict[k_hi]
-            t = (target_strike - k_lo) / (k_hi - k_lo)
-            return v_lo + t * (v_hi - v_lo)
-    return 0.0
+    vols = [skew_dict[k] for k in strikes]
 
-def get_vol_at_strike_from_df(near_df: pd.DataFrame, K: float, F: float,
-                                T: float, rfr: float, side: str) -> float:
-    """
-    Look up the IV (%) at strike K from near-term expiry DataFrame.
-    Uses nearest strike if exact strike not available.
-    side: 'put' or 'call'
-    """
-    strikes = near_df["strike"].values
-    idx = np.argmin(np.abs(strikes - K))
-    K_nearest = strikes[idx]
-    row = near_df[near_df["strike"] == K_nearest].iloc[0]
-    if side == 'put':
-        price = row["pmid"] if not math.isnan(row["pmid"]) else row["cmid"]
-    else:
-        price = row["cmid"] if not math.isnan(row["cmid"]) else row["pmid"]
-    if math.isnan(price) or price <= 0:
-        return 0.0
-    iv = bs_iv(price, F, K_nearest, T, rfr, is_call=(side == 'call'))
-    return iv
+    if target_strike <= strikes[0]:
+        return vols[0]
+    if target_strike >= strikes[-1]:
+        return vols[-1]
+
+    # Fit cubic spline and evaluate at target strike
+    cs = CubicSpline(strikes, vols, bc_type="natural")
+    return float(cs(target_strike))
 
 def _delta_func(K: float, target_delta: float, S: float,
                 skew_dict: dict, T30: float, side: str) -> float:
@@ -535,56 +497,17 @@ def find_strike_for_delta(target_delta: float, S: float,
             K = S * math.exp(-sigma * math.sqrt(T30) * inv + 0.5 * sigma ** 2 * T30)
         return max(K, 0.5 * S)
 
-# FACTOR GENERATION
-def get_near_term_vol_at_strike(
-    near_df: pd.DataFrame, F: float, T: float, rfr: float,
-    K_target: float, K_atm_near: float
-) -> float:
-    """
-    Get the raw near-term IV at a specific strike from the near-term expiry chain.
-    
-    This is the 'vol_old(S_new)' for F1 per the whitepaper (P13, F1 formula):
-    "vol_old(S_new) = vol of OLD near-term near-ATM option evaluated at NEW near-term near-ATM strike"
-    
-    Uses the OLD near-term near-ATM option type (call if K_target >= K_atm_near, 
-    put if K_target < K_atm_near) at the K_target strike from the raw near-term chain.
-    
-    Parameters
-    ----------
-    near_df     : DataFrame with near-term expiry options (columns: strike, cmid, pmid)
-    F           : forward price for near-term
-    T           : time to expiration in years for near-term
-    rfr         : risk-free rate
-    K_target    : strike at which to evaluate IV
-    K_atm_near  : near-term ATM strike (used to decide call vs put)
-    """
-    near_strikes = near_df["strike"].values
-    idx = np.argmin(np.abs(near_strikes - K_target))
-    K_nearest = near_strikes[idx]
-    row = near_df[near_df["strike"] == K_nearest].iloc[0]
-    
-    # Use call if K >= K_atm (in the money on calls side), else put
-    if K_target >= K_atm_near:
-        price = row["cmid"] if not math.isnan(row["cmid"]) else row["pmid"]
-        is_call = True
-    else:
-        price = row["pmid"] if not math.isnan(row["pmid"]) else row["cmid"]
-        is_call = False
-    
-    if math.isnan(price) or price <= 0:
-        return 0.0
-    
-    iv = bs_iv(price, F, K_nearest, T, rfr, is_call=is_call)
-    return iv
-
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
     Run 6-factor VIX decomposition between two consecutive dates.
-    Uses the 30-day interpolated skew methodology from the CBOE whitepaper.
+    Uses the 30-day blended skew methodology from the CBOE whitepaper.
+
+    After building the 30d blended skew surface, only the blended dicts are used.
+    Near/far chains are never referenced for decomposition.
 
     Methodology (Whitepaper P13-P22):
-    - F1: vol_old(S_new) - vol_old(S_old), OLD near-term near-ATM IV at S_new
-    - F2: vol_new(S_new) - vol_old(S_new), NEW near-term near-ATM IV at S_new
+    - F1: σ30_old(S_new) − σ30_old(S_old_ATM)  [blended vol, sticky strike]
+    - F2: σ30_new(S_new) − σ30_old(S_new)         [blended vol, parallel shift]
     - F3: put skew gradient at 30-delta put strike (single-strike approx)
     - F4: call skew gradient at 30-delta call strike (single-strike approx)
     - F5: downside convexity at 10-delta put strike (single-strike approx)
@@ -599,47 +522,32 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     if not put_old or not put_new or not call_old or not call_new:
         return None
 
-    # ── Spot and ATM vols ──────────────────────────────────────────────────
+    # ── Spot prices ────────────────────────────────────────────────────────
     S_old = prev["spot"]
     S_new = curr["spot"]
 
-    # ATM vol from previous date's near-term ATM strike
-    K_atm_old = prev["K_atm1"]
-    prev_IV1 = prev["IV1"]
-    prev_atm_vol = prev_IV1  # ATM vol from previous date
-
     # ── F1: Sticky Strike ──────────────────────────────────────────────────
-    # F1 = vol_old(S_new) - vol_old(S_old) per whitepaper P13 Eq 4
-    # Where "vol_old(S)" = OLD near-term near-ATM IV at strike S
-    # This uses the RAW near-term chain IV (not 30d interpolated), from the
-    # OLD near-term near-ATM option type (call if K>=K_atm, put if K<K_atm)
-    # evaluated at the NEW near-term near-ATM strike.
-    vol_old_at_S_new = get_near_term_vol_at_strike(
-        prev["chain1_df"], prev["F"], prev["T1"], prev["rfr"],
-        S_new, K_atm_old
-    )
-    F1 = vol_old_at_S_new - prev_atm_vol
+    # F1 = σ30_old(S_new) − σ30_old(S_old_ATM)
+    # Read OLD blended 30d vol at NEW spot strike (using both put and call sides)
+    # and subtract the OLD blended ATM vol (vol at old spot on old blended skew).
+    if S_new < S_old:
+        # spot moved down → use put skew for both
+        vol_old_at_S_new = get_vol_at_strike(put_old, S_new)
+        vol_old_atm_old = get_vol_at_strike(put_old, S_old)
+    else:
+        # spot moved up → use call skew for both
+        vol_old_at_S_new = get_vol_at_strike(call_old, S_new)
+        vol_old_atm_old = get_vol_at_strike(call_old, S_old)
+    F1 = vol_old_at_S_new - vol_old_atm_old
 
     # ── F2: Parallel Shift ─────────────────────────────────────────────────
-    # F2 = vol_new(S_new) - vol_old(S_new) per whitepaper P18 Eq 5
-    # Both evaluated at the same strike (S_new) on new vs old skews.
-    # Uses the NEW near-term near-ATM call/put IV at S_new.
-    vol_new_at_S_new = get_near_term_vol_at_strike(
-        curr["chain1_df"], curr["F"], curr["T1"], curr["rfr"],
-        S_new, curr["K_atm1"]
-    )
+    # F2 = σ30_new(S_new) − σ30_old(S_new)
+    # Read NEW blended 30d vol at S_new minus OLD blended 30d vol at S_new.
+    if S_new < S_old:
+        vol_new_at_S_new = get_vol_at_strike(put_new, S_new)
+    else:
+        vol_new_at_S_new = get_vol_at_strike(call_new, S_new)
     F2 = vol_new_at_S_new - vol_old_at_S_new
-
-    # Use current day's near/far data to find strikes for target deltas
-    # Signed delta convention: puts = N(d1)-1 (negative), calls = N(d1) (positive)
-    curr_near_df = curr["chain1_df"]
-    curr_far_df = curr["chain2_df"]
-    curr_dte_near = curr["DTE1"]
-    curr_dte_far = curr["DTE2"]
-    curr_atm_vol = curr["IV1"]
-    curr_atm_k = curr["K_atm1"]
-    curr_F = curr["F"]
-    curr_rfr = curr["rfr"]
 
     T30 = 30.0 / 365.0
 
@@ -799,10 +707,9 @@ def main():
         print(f"  {snap_date_str}: SPX={spot:,.2f}, "
               f"VIX_comp={vix_result['vix_computed']:.2f}, "
               f"VIX_actual={vix_result.get('vix_actual', 'N/A')}, "
-              f"NearExp={vix_result['near_exp']}({vix_result['DTE1']}d) "
-              f"-> IV1={vix_result['IV1']:.2f}%, "
-              f"NextExp={vix_result['next_exp']}({vix_result['DTE2']}d) "
-              f"-> IV2={vix_result['IV2']:.2f}%")
+              f"NearExp={vix_result['near_exp']}({vix_result['DTE1']}d), "
+              f"NextExp={vix_result['next_exp']}({vix_result['DTE2']}d), "
+              f"σ30d={vix_result['sigma_30d']*100:.2f}%")
 
     print(f"\nProcessed {len(results)} valid dates, {skipped} skipped\n")
 
